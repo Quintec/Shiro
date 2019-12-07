@@ -1,4 +1,9 @@
-import PyV8
+from excepthook import uncaught_exception, install_thread_excepthook
+import sys
+sys.excepthook = uncaught_exception
+install_thread_excepthook()
+
+import boardgen
 import getpass
 from PIL import Image, ImageDraw, ImageFont
 import StringIO
@@ -6,32 +11,38 @@ import urllib2, urllib
 import json
 import random
 import traceback
+import HTMLParser
 
-import chatexchange.client
-import chatexchange.events
+unescape = HTMLParser.HTMLParser().unescape
+
+from ChatExchange import chatexchange
 import re
-import sys
 import os
 import time
 import puush
+import sqlite3
 
 import requests
 from requests.auth import HTTPBasicAuth
+from helpers import log, log_exception
 
 imagehost = 'puush'
 
 guessed = []
 board = []
-ctxt = PyV8.JSContext()
-ctxt.enter()
-ctxt.eval(open("boardgen.js").read())
 shutdown = False
+whose_turn = "None"
+num_guesses = 0
 
-OTS_User = 'zaroogous@safetymail.info'
+if 'OTS_User' in os.environ:
+    OTS_User = os.environ['OTS_User']
+else:
+    OTS_User = raw_input("OneTimeSecret User: ")
+
 if 'OTS_Password' in os.environ:
     OTS_Password = os.environ['OTS_Password']
 else:
-    OTS_Password = raw_input("OTS Password: ")
+    OTS_Password = raw_input("OneTimeSecret API Key: ")
 
 if 'Puush_API_Key' in os.environ:
     Puush_API_Key = os.environ['Puush_API_Key']
@@ -44,11 +55,13 @@ blue = []
 red = []
 
 def main():
-    global room
+    global room, my_user
     init('0')
+    init_whitelist()
+    init_pinglist()
 
     host_id = 'stackexchange.com'
-    room_id = '59120'  # Sandbox
+    room_id = '59120'  # Codenames
 
     if 'ChatExchangeU' in os.environ:
         email = os.environ['ChatExchangeU']
@@ -61,20 +74,92 @@ def main():
 
     client = chatexchange.client.Client(host_id)
     client.login(email, password)
+    my_user = client.get_me()
 
     room = client.get_room(room_id)
     room.join()
     room.watch(on_message)
 
-    print("(You are now in room #%s on %s.)" % (room_id, host_id))
+    log('info', "(You are now in room #%s on %s.)" % (room_id, host_id))
     while not shutdown:
         message = raw_input("<< ")
-        room.send_message(message)
-
+        
     client.logout()
 
 passphrases = ["[passing]","[pass]"] #stuff that indicates somebody is passing
-TRUSTED_USER_IDS = [200996, 233269, 209507, 238144, 263999, 156773, 69330, 190748, 155240, 56166, 251910, 17335, 240387, 21351, 188759, 174589, 254945, 152262, 207333, 215298, 147578, 242914, 217429]
+TRUSTED_USER_IDS = [200996, 233269, 209507, 238144, 263999, 156773, 69330, 190748, 155240, 56166, 251910, 17335, 240387, 21351, 188759, 174589, 254945, 152262, 207333, 215298, 147578, 242914, 217429, 147578]
+PING_NAMES = ['ffao']
+
+def init_whitelist():
+    global TRUSTED_USER_IDS
+    db = sqlite3.connect('temp.db')
+    
+    results = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='whitelist'");
+    if not results.fetchall():
+        db.execute('CREATE TABLE whitelist (ID int)')
+        db.commit()
+        db.close()
+
+        db = sqlite3.connect('temp.db', isolation_level=None)
+        db.executemany('INSERT INTO whitelist (ID) values (?)', [(x,) for x in TRUSTED_USER_IDS])
+        db.commit()
+    else:
+        results = db.execute("SELECT * FROM whitelist")
+        TRUSTED_USER_IDS = [x[0] for x in results.fetchall()]
+        log('debug', "TRUSTED: " + str(TRUSTED_USER_IDS))
+
+    db.close()
+
+def init_pinglist():
+    global PING_NAMES
+    db = sqlite3.connect('temp.db')
+    
+    results = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pinglist'");
+    if not results.fetchall():
+        db.execute('CREATE TABLE pinglist (name text)')
+        db.commit()
+        db.close()
+
+        db = sqlite3.connect('temp.db', isolation_level=None)
+        db.executemany('INSERT INTO pinglist (name) values (?)', [(x,) for x in PING_NAMES])
+        db.commit()
+    else:
+        results = db.execute("SELECT * FROM pinglist")
+        PING_NAMES = [x[0] for x in results.fetchall()]
+        log('debug', "PINGABLE: " + str(PING_NAMES))
+
+    db.close()
+
+def add_whitelist(msg):
+    ID = int(msg.split(None, 1)[1])
+    TRUSTED_USER_IDS.append(ID)
+
+    db = sqlite3.connect('temp.db')
+    db.execute('INSERT INTO whitelist (ID) values (?)', (ID,))
+    db.commit()
+    db.close()
+
+def add_pinglist(msg, name=None):
+    if name is None:
+        name = unescape(msg.split(None, 1)[1]).strip()
+    room.send_message("Adding {} to the pinglist.".format(name))
+    PING_NAMES.append(name)
+
+    db = sqlite3.connect('temp.db')
+    db.execute('INSERT INTO pinglist (name) values (?)', (name,))
+    db.commit()
+    db.close()
+
+def remove_pinglist(msg, name=None):
+    if name is None:
+        name = unescape(msg.split(None, 1)[1]).strip()
+    room.send_message("Removing {} from the pinglist.".format(name))
+    PING_NAMES.remove(name)
+
+    db = sqlite3.connect('temp.db')
+    db.execute('DELETE FROM pinglist WHERE name = ?', (name,))
+    db.commit()
+    db.close()
 
 def cooldown(seconds):
     def inner(fn):
@@ -88,54 +173,80 @@ def cooldown(seconds):
     return inner
 
 def on_message(message, client):
-    global shutdown
+    global shutdown, whose_turn, num_guesses, red, blue
     if not isinstance(message, chatexchange.events.MessagePosted):
         # Ignore non-message_posted events.
         return
 
-    is_shiro = (message.user.id == 285026)
-    is_super_user = (message.user.id == 200996 or message.user.is_moderator)
-    is_trusted_user = (message.user.id in TRUSTED_USER_IDS or is_super_user)
+    is_shiro = (message.user.id == my_user.id)
+    is_super_user = (is_shiro or message.user.id == 200996 or message.user.is_moderator)
+    is_trusted_user = (is_super_user or message.user.id in TRUSTED_USER_IDS)
 
     #print("")
     #print(">> (%s / %s) %s" % (message.user.name, repr(message.user.id), message.content))
 
     try:
-        pat = re.compile("\s*<b>(.*)</b>\s*", re.IGNORECASE)
-        m = re.match(pat, message.content)
-        if m is not None:
-            guess = m.groups()[0].strip().lower()
+        clue_pattern = re.compile(r"(?:Red|Blue): <b>.+(?:</b>)?\s*\((\d+|unlimited|\u221e)\)(?:</b>)?", re.IGNORECASE) #Strange things happening with this pattern
+        clue_match = re.match(clue_pattern, message.content)
+
+        if not is_shiro and clue_match is not None and ((whose_turn == "SMRed" and message.user.name == red[0]) or (whose_turn == "SMBlue" and message.user.name == blue[0])):
+            clue = clue_match.groups()[0].strip().lower()
+            #print("Matched clue: %s" % (clue))
+            if clue.isdigit() and int(clue) > 0:
+                num_guesses = int(clue) + 1
+            else:
+                num_guesses = 100
+            toggle_turn()
+
+        #print("num guesses: %s" % (num_guesses))
+            
+        pat = re.compile(r"\s*<b>(.*)</b>\s*", re.IGNORECASE)
+        guess_match = re.match(pat, message.content)
+
+        if not is_shiro and guess_match is not None and ((whose_turn == "Red" and message.user.name in red[1:]) or (whose_turn == "Blue" and message.user.name in blue[1:])):
+            guess = guess_match.groups()[0].strip().lower()
             if guess in passphrases:
                 show_board()
+                toggle_turn()
             else:
-                guessed.append( guess )
-
+                process_guess(guess.upper())
+                
         if is_shiro and message.content.strip().startswith("<b>RED</b>:"):
             pin_red(message.message)
 
         if is_shiro and message.content.strip().startswith("<b>BLUE</b>:"):
             pin_blue(message.message) 
+            
+        if is_trusted_user and message.content.lower().strip() == "!teams":
+            show_teams()
 
         if is_trusted_user and message.content.lower().strip() == "!board":
             show_board()
 
-        if is_trusted_user and message.content.lower().strip() == "!undo":
-            guessed.pop()
-
         if is_trusted_user and message.content.lower().strip() == "!flipcoin":
             flip_coin()
+            
+        if is_trusted_user and message.content.lower().strip() == "!blame":
+            blame()
 
         if is_trusted_user and message.content.lower().strip() == "!recall":
             recall()
 
         if is_trusted_user and message.content.lower().startswith("!join"):
             add_user(message.content, message.user.name)
+        elif message.content.lower().strip() == "!join":
+            add_user(message.content, message.user.name)
 
         if is_trusted_user and message.content.lower().startswith("!leave"):
+            remove_user(message.content, message.user.name)
+        elif message.content.lower().strip() == "!leave":
             remove_user(message.content, message.user.name)
 
         if is_trusted_user and message.content.lower().startswith("!newgame"):
             new_game(message.content)
+
+        if is_super_user and message.content.lower().startswith("!whitelist"):
+            add_whitelist(message.content)
         
         if is_trusted_user and message.content.lower().strip() == "!finalboard":
             show_final()
@@ -154,12 +265,99 @@ def on_message(message, client):
         if is_super_user and message.content.lower().strip() == "!shutdown":
             shutdown = True
 
-    except:
-        traceback.print_exc()
-        print ""
+        if is_super_user and message.content.lower().strip() == "!ping":
+            ping()
+            
+        if message.content.lower().strip() == "!help":
+            info()
 
+        if is_trusted_user and message.content.lower().strip() == "!pingable":
+            add_pinglist(message.content, message.user.name.replace(" ", ""))
+        elif is_super_user and message.content.lower().startswith("!pingable"):
+            add_pinglist(message.content)
+
+        if is_trusted_user and message.content.lower().strip() == "!notpingable":
+            remove_pinglist(message.content, message.user.name.replace(" ", ""))
+        elif is_super_user and message.content.lower().startswith("!notpingable"):
+            remove_pinglist(message.content)
+
+        if is_trusted_user and message.content.lower().startswith("!pinglist"):
+            pinglist()
+
+        if is_trusted_user and (message.content.lower().startswith("!who") or message.content.lower().strip() == "!guesses"):
+            #print(whose_turn)
+            if whose_turn == "Red" or whose_turn == "Blue":
+                room.send_message("%s currently has %s guesses remaining." % (whose_turn, num_guesses if num_guesses < 25 else "unlimited"))
+            elif whose_turn[:2] == "SM":
+                room.send_message("We are currently waiting for a clue from the %s spymaster." % (whose_turn[2:]))
+
+    except:
+        log_exception(*sys.exc_info())
+        #traceback.print_exc()
+        #print ""
+
+def process_guess(guess):
+    global whose_turn, num_guesses
+    condolences = ["Oh, dear.\n", "That's too bad.\n", "I feel for you.\n", "What were you thinking?\n", "Uh... what?\n", "Maybe you'll do better next time.\n", "Seriously?\n", "I hope you feel okay about that.\n", "When will you learn?\n"]
+    if guess in board[1]:
+        guessed.append( guess.lower() )
+        message = guess
+        new_turn = False
+        game_over = False
+        guess_color = board[2][board[1].index(guess)]
+        if guess_color == "#00eeee":
+            message += " is Blue\n"
+            if whose_turn == "Red":
+                new_turn = True
+                message += random.choice(condolences)
+            elif whose_turn == "Blue":
+                num_guesses -= 1
+                if num_guesses == 0:
+                    message += "You are out of guesses. "
+                    new_turn = True
+        elif guess_color == "#ff0000":
+            message += " is Red\n"
+            if whose_turn == "Blue":
+                new_turn = True
+                message += random.choice(condolences)
+            elif whose_turn == "Red":
+                num_guesses -= 1
+                if num_guesses == 0:
+                    message += "You are out of guesses. "
+                    new_turn = True
+        elif guess_color == "#ffff00":
+            message += " is Yellow (neutral)\n"
+            new_turn = True
+        elif guess_color == "#808080":
+            message += " is Black (assassin!).\nGame over. "
+            if whose_turn == "Blue":
+                message += "Red wins!"
+            elif whose_turn == "Red":
+                message += "Blue wins!"
+            game_over = True
+        
+        if new_turn:
+            if whose_turn == "Blue":
+                message += "It is now Red's turn"
+            elif whose_turn == "Red":
+                message += "It is now Blue's turn"
+            toggle_turn()
+            
+        room.send_message(message)
+        if new_turn:
+            show_board()
+        if game_over:
+            show_final()
+        
+    else:
+        room.send_message("%s doesn't appear to be on the board..." % (guess.upper()))
+
+        
 def flip_coin():
     room.send_message(random.choice(["Red", "Blue"]))
+    
+def blame():
+    room.send_message("It's %s's fault." % (random.choice(red + blue)))
 
 def change_host(msg):
     global imagehost
@@ -168,21 +366,26 @@ def change_host(msg):
     if len(pieces) >= 2:
         new_host = pieces[1].strip()
         if new_host in ['imgur', 'puush']: imagehost = new_host
+            
+def info():
+    room.send_message("Hello! I'm Shiro, a bot to help with the game Codenames. To see the rules and a list of commands that you can use, see [this answer on Puzzling Meta](https://puzzling.meta.stackexchange.com/a/5989). Have fun!")
 
+@cooldown(5)
 def new_game(msg):
-    global red, blue
+    global red, blue, whose_turn
     players = None
 
     try:
-        players = [x.strip() for x in msg[8:].split(",")]
+        players = [unescape(x).strip() for x in msg[8:].split(",")]
     except Exception, e:
         return
 
     red = []
     blue = []
 
-    print "players: ", players
-    if players is not None and len(players) >= 4:
+    log('info', 'New game is starting!')
+    log('debug', "players: {}".format(players))
+    if players is not None and len(players) >= 2:
         spymasters = players[:2]
         random.shuffle(spymasters)
 
@@ -209,7 +412,6 @@ def new_game(msg):
         time.sleep(2)
 
     seed = str(random.randint(1, 1000000000))
-    print 'everything is done'
 
     my_message = '''RED spymaster only, please click on this link to see the seed: %s
 BLUE spymaster only, please click on this link to see the seed: %s
@@ -221,8 +423,10 @@ Please save the seed somewhere! As a last resort if any of you happens to forget
     init(seed)
     if board[0]=="#00eeee":
         room.send_message("BLUE goes first!")
+        whose_turn = "SMBlue"
     elif board[0]=="#ff0000":
         room.send_message("RED goes first!")
+        whose_turn = "SMRed"
     show_board()
 
 
@@ -237,7 +441,7 @@ def add_user(content, name):
     if len(segments) == 1:
         joining_user = name
     else:
-        joining_user = segments[1]
+        joining_user = unescape(segments[1]).strip()
 
     dest_color = ''
     if content.lower().strip().startswith("!joinred"):
@@ -269,7 +473,7 @@ def remove_user(content, name):
     if len(segments) == 1:
         leaving_user = name
     else:
-        leaving_user = segments[1]
+        leaving_user = unescape(segments[1]).strip()
 
     if leaving_user in red[1:]:
         red.reverse()
@@ -303,6 +507,16 @@ def show_board():
     time.sleep(3)
     room.send_message( upload_image(im) )
 
+@cooldown(10)
+def ping():
+    for x in range(0, len(PING_NAMES), 10):
+        room.send_message( " ".join('@'+x for x in PING_NAMES[x:x+10]) )
+
+@cooldown(10)
+def pinglist():
+    room.send_message( " ".join(x for x in PING_NAMES) )
+
+@cooldown(10)
 def show_final():
     solved = range(25)
     '''Past code, in case this doesn't work for some reason:
@@ -317,8 +531,7 @@ def show_final():
     room.send_message( upload_image(im) )
 
 def get_board(seed):
-    ctxt.locals.obtainedseed = seed
-    board = ctxt.eval("createNewGame(obtainedseed);").split(',')
+    board = boardgen.createNewGame(seed).split(',')
     
     print board
     return board[0], board[1:26], board[26:51]
@@ -382,14 +595,22 @@ def draw_grid(seed, solved):
 def pin_red(msg):
     global pinned_message_red
     if pinned_message_red is not None:
-        pinned_message_red.cancel_stars()
+        try:
+            pinned_message_red._client._br.edit_message(pinned_message_red.id, "**RED**: *%s*, %s" % (red[0], ', '.join(red[1:])))
+            return
+        except:
+            pinned_message_red.cancel_stars()
     msg.pin()
     pinned_message_red = msg
 
 def pin_blue(msg):
     global pinned_message_blue
     if pinned_message_blue is not None:
-        pinned_message_blue.cancel_stars()
+        try:
+            pinned_message_blue._client._br.edit_message(pinned_message_blue.id, "**BLUE**: *%s*, %s" % (blue[0], ', '.join(blue[1:])))
+            return
+        except:
+            pinned_message_blue.cancel_stars()
     msg.pin()
     pinned_message_blue = msg
 
@@ -417,5 +638,23 @@ def submit_secret(secret):
     data = {'secret': secret}
     r = requests.post('https://onetimesecret.com/api/v1/share', data=data, auth=HTTPBasicAuth(OTS_User, OTS_Password))
     return 'https://onetimesecret.com/secret/' + r.json()['secret_key']
+
+def show_teams():
+    global red,blue
+    room.send_message("**RED team**: *%s*, %s" % (red[0], ', '.join(red[1:])))
+    room.send_message("**BLUE team**: *%s*, %s" % (blue[0], ', '.join(blue[1:])))
+
+def toggle_turn():
+    global whose_turn
+    if whose_turn == "Blue":
+        whose_turn = "SMRed"
+        num_guesses = 0
+    elif whose_turn == "SMRed":
+        whose_turn = "Red"
+    elif whose_turn == "Red":
+        whose_turn = "SMBlue"
+        num_guesses = 0
+    elif whose_turn == "SMBlue":
+        whose_turn = "Blue"
 
 main()
